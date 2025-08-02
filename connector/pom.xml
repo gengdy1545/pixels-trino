@@ -67,7 +67,6 @@
         <dependency>
             <groupId>io.pixelsdb</groupId>
             <artifactId>pixels-invoker-spike</artifactId>
-            <optional>true</optional>
         </dependency>
         <dependency>
             <groupId>io.pixelsdb</groupId>
