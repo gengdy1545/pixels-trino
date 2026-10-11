@@ -34,6 +34,8 @@ public final class PixelsBufferSplit extends PixelsSplit
     private final String originSchemaString;
     private final long tableId;
     private final int vNodeId;
+    private final List<Long> regularFileIds;
+    private final List<PixelsFileDescriptor> virtualFiles;
 
     @JsonCreator
     public PixelsBufferSplit(
@@ -49,13 +51,17 @@ public final class PixelsBufferSplit extends PixelsSplit
             @JsonProperty("columnOrder") List<String> columnOrder,
             @JsonProperty("constraint") TupleDomain<PixelsColumnHandle> constraint,
             @JsonProperty("originColumnSize") int originColumnSize,
-            @JsonProperty("originSchemaString") String originSchemaString)
+            @JsonProperty("originSchemaString") String originSchemaString,
+            @JsonProperty("regularFileIds") List<Long> regularFileIds,
+            @JsonProperty("virtualFiles") List<PixelsFileDescriptor> virtualFiles)
     {
         super(transId, splitId, connectorId, schemaName, tableName, storageScheme, addresses, columnOrder, constraint);
         this.originColumnSize = originColumnSize;
         this.originSchemaString = originSchemaString;
         this.tableId = tableId;
         this.vNodeId = vNodeId;
+        this.regularFileIds = List.copyOf(regularFileIds);
+        this.virtualFiles = List.copyOf(virtualFiles);
     }
 
     @JsonProperty
@@ -80,5 +86,17 @@ public final class PixelsBufferSplit extends PixelsSplit
     public int getvNodeId()
     {
         return vNodeId;
+    }
+
+    @JsonProperty
+    public List<Long> getRegularFileIds()
+    {
+        return regularFileIds;
+    }
+
+    @JsonProperty
+    public List<PixelsFileDescriptor> getVirtualFiles()
+    {
+        return virtualFiles;
     }
 }

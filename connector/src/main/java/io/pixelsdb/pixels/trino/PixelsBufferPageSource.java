@@ -24,9 +24,11 @@ import io.airlift.configuration.testing.ConfigAssertions;
 import io.airlift.log.Logger;
 import io.pixelsdb.pixels.common.exception.RetinaException;
 import io.pixelsdb.pixels.common.physical.Storage;
+import io.pixelsdb.pixels.common.physical.StorageFactory;
 import io.pixelsdb.pixels.common.retina.RetinaService;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
 import io.pixelsdb.pixels.core.TypeDescription;
+import io.pixelsdb.pixels.core.PixelsFooterCache;
 import io.pixelsdb.pixels.core.reader.PixelsReaderOption;
 import io.pixelsdb.pixels.core.reader.PixelsRecordReaderBufferImpl;
 import io.pixelsdb.pixels.core.utils.Bitmap;
@@ -37,6 +39,8 @@ import io.pixelsdb.pixels.retina.RetinaProto;
 import io.pixelsdb.pixels.trino.exception.PixelsErrorCode;
 import io.pixelsdb.pixels.trino.impl.PixelsTrinoConfig;
 import io.pixelsdb.pixels.trino.split.PixelsBufferSplit;
+import io.pixelsdb.pixels.trino.split.PixelsFileDescriptor;
+import io.pixelsdb.pixels.trino.split.PixelsFileSplit;
 import io.trino.spi.HostAddress;
 import io.trino.spi.Page;
 import io.trino.spi.TrinoException;
@@ -76,6 +80,8 @@ public class PixelsBufferPageSource implements PixelsPageSource
     private long totalReadTimeNanos;
     private PixelsReaderOption option;
     private PixelsRecordReaderBufferImpl reader;
+    private PixelsFilePageSource fallbackPageSource;
+    private boolean hotSourcesFinished;
 
     public PixelsBufferPageSource(PixelsBufferSplit split, List<PixelsColumnHandle> columnHandles,
                                   PixelsTransactionHandle transactionHandle,
@@ -186,19 +192,44 @@ public class PixelsBufferPageSource implements PixelsPageSource
 
             RetinaProto.GetWriteBufferResponse response =
                     retinaService.getWriteBuffer(split.getSchemaName(), split.getTableName(), split.getvNodeId(), option.getTransTimestamp());
-            byte[] activeMemtableData = response.getData().toByteArray();
+            WriteBufferSourceSelector.Selection selection = WriteBufferSourceSelector.select(
+                    split.getRegularFileIds(), split.getVirtualFiles(), response);
             this.reader = new PixelsRecordReaderBufferImpl(
                     option,
                     retinaServiceHost,
-                    activeMemtableData, response.getIdsList(),
-                    response.getBitmapsList(),
+                    selection.getActiveData(),
+                    selection.getHotObjectIds(),
+                    selection.getHotBitmaps(),
                     storage,
                     split.getTableId(),
                     split.getvNodeId(),
                     schema
             );
-            this.splitMemoryUsage += activeMemtableData.length;
-        } catch (RetinaException | IOException e)
+            this.splitMemoryUsage += selection.getActiveData().length;
+
+            List<PixelsFileDescriptor> fallbackFiles = selection.getFallbackFiles();
+            if (!fallbackFiles.isEmpty())
+            {
+                String fallbackScheme = fallbackFiles.getFirst().getStorageScheme();
+                if (fallbackFiles.stream().anyMatch(file -> !fallbackScheme.equals(file.getStorageScheme())))
+                {
+                    throw new IOException("Fallback files use different storage schemes");
+                }
+                PixelsFileSplit fallbackSplit = new PixelsFileSplit(
+                        split.getTransId(), split.getSplitId(), split.getConnectorId(),
+                        split.getSchemaName(), split.getTableName(), fallbackScheme,
+                        fallbackFiles.stream().map(PixelsFileDescriptor::getPath).toList(),
+                        Collections.nCopies(fallbackFiles.size(), 0),
+                        fallbackFiles.stream().map(PixelsFileDescriptor::getRowGroupCount).toList(),
+                        false, false, split.getAddresses(), split.getColumnOrder(),
+                        Collections.emptyList(), split.getConstraint(), false, false);
+                this.fallbackPageSource = new PixelsFilePageSource(
+                        fallbackSplit, columns, transactionHandle,
+                        StorageFactory.Instance().getStorage(fallbackScheme),
+                        Collections.emptyList(), Collections.emptyList(), 0,
+                        new PixelsFooterCache());
+            }
+        } catch (RetinaException | IOException | IllegalArgumentException e)
         {
             throw new TrinoException(PixelsErrorCode.PIXELS_READER_ERROR,
                     "Can't get super version of: " + split.getSchemaName() + "/" + split.getTableName(), e);
@@ -226,9 +257,25 @@ public class PixelsBufferPageSource implements PixelsPageSource
             }
 
 
+            if (hotSourcesFinished)
+            {
+                Page page = fallbackPageSource == null ? null : fallbackPageSource.getNextPage();
+                if (page == null && (fallbackPageSource == null || fallbackPageSource.isFinished()))
+                {
+                    this.close();
+                }
+                return page;
+            }
+
             VectorizedRowBatch rowBatch = reader.readBatch();
             if (rowBatch.endOfFile)
             {
+                hotSourcesFinished = true;
+                reader.close();
+                if (fallbackPageSource != null)
+                {
+                    return getNextPage();
+                }
                 this.close();
                 return null;
             }
@@ -297,7 +344,8 @@ public class PixelsBufferPageSource implements PixelsPageSource
         {
             return splitMemoryUsage;
         }
-        return splitMemoryUsage + reader.getMemoryUsage();
+        return splitMemoryUsage + reader.getMemoryUsage()
+                + (fallbackPageSource == null ? 0 : fallbackPageSource.getMemoryUsage());
     }
 
     /**
@@ -312,6 +360,33 @@ public class PixelsBufferPageSource implements PixelsPageSource
         }
 
         closed = true;
+        RuntimeException closeFailure = null;
+        try
+        {
+            if (reader != null)
+            {
+                reader.close();
+            }
+        }
+        catch (IOException e)
+        {
+            closeFailure = new TrinoException(PixelsErrorCode.PIXELS_READER_CLOSE_ERROR, e);
+        }
+        if (fallbackPageSource != null)
+        {
+            try
+            {
+                fallbackPageSource.close();
+            }
+            catch (RuntimeException e)
+            {
+                closeFailure = e;
+            }
+        }
+        if (closeFailure != null)
+        {
+            throw closeFailure;
+        }
     }
 
     @Override
